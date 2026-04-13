@@ -183,6 +183,11 @@ def verify_output(src_info, dst_path, language_filter=False):
 
 def process_one(path_str, settings, gpu_index=0):
     _current_paths[gpu_index] = path_str
+    # Guard against stale queue entries: if this file already completed (or is
+    # being worked on by another GPU), drop it silently.
+    existing = db.get_file(path_str)
+    if existing and existing["status"] in ("done", "skipped", "working", "superseded"):
+        return
     src = Path(path_str)
     if not src.exists():
         db.upsert_file(path_str, status="error", error="file gone before transcode")

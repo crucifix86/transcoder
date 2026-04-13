@@ -98,11 +98,10 @@ def savings_by_show():
             for k, v in sorted(groups.items())]
 
 def requeue_stuck():
-    """Revert any 'working' rows back to 'pending' so they get picked up after a crash.
-    Returns list of paths requeued."""
+    """Return all paths that should be (re)queued on startup: any 'working' rows
+    (crash mid-transcode) and any 'pending' rows (queued but not yet processed).
+    'working' gets reverted to 'pending'."""
     with _lock, get_conn() as c:
-        rs = c.execute("SELECT path FROM files WHERE status='working'").fetchall()
-        paths = [r["path"] for r in rs]
-        if paths:
-            c.execute("UPDATE files SET status='pending', error='requeued after restart' WHERE status='working'")
-        return paths
+        c.execute("UPDATE files SET status='pending', error='requeued after restart' WHERE status='working'")
+        rs = c.execute("SELECT path FROM files WHERE status='pending'").fetchall()
+        return [r["path"] for r in rs]

@@ -25,8 +25,8 @@ def scan_folder(root, target_codec, target_container, skip_if_match=True, min_bi
                 continue
             path_str = str(p)
             existing = db.get_file(path_str)
-            # skip if we already finished it or it's in progress
-            if existing and existing["status"] in ("done", "skipped", "working"):
+            # skip if we already finished it, or it's already known/queued/in-progress
+            if existing and existing["status"] in ("done", "skipped", "working", "pending"):
                 continue
             # if we failed it before, leave it as error unless manually reset
             if existing and existing["status"] == "error":
