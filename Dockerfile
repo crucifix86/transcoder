@@ -1,14 +1,16 @@
 FROM jrottenberg/ffmpeg:7.0-nvidia AS ffmpeg
 FROM python:3.12-slim
 
-# ffmpeg with GPU support from the multi-stage base
+# ffmpeg binaries + its own bundled codec .so files come from the multi-stage base
 COPY --from=ffmpeg /usr/local /usr/local
-# Runtime libs ffmpeg needs (VAAPI for Intel, plus codec libs), curl for healthcheck
+RUN /sbin/ldconfig /usr/local/lib
+# System runtime deps only: VAAPI for Intel/AMD hardware accel, and curl for the
+# healthcheck. All codec libs (x264/x265/vpx/fdk-aac/etc.) ship inside /usr/local
+# from the ffmpeg base, so we do NOT apt-install them here.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      libva2 libva-drm2 libva-x11-2 vainfo intel-media-va-driver-non-free \
-      libnuma1 libass9 libvorbisenc2 libvpx7 libx264-164 libx265-199 \
-      libfdk-aac2 libmp3lame0 libopus0 libtheora0 libfreetype6 libfontconfig1 \
-      curl \
+      libva2 libva-drm2 libva-x11-2 vainfo \
+      libnuma1 libass9 libfreetype6 libfontconfig1 \
+      curl ca-certificates \
   && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
