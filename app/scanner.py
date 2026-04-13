@@ -5,8 +5,9 @@ from .probe import VIDEO_EXTS, probe, normalize_codec
 
 TRASH_DIRNAME = ".transcoder-trash"
 TEMP_SUFFIX = ".transcoding"
+MAX_ATTEMPTS = 3
 
-def scan_folder(root, target_codec, target_container, skip_if_match=True):
+def scan_folder(root, target_codec, target_container, skip_if_match=True, min_bitrate_kbps=0):
     """Walk folder, record files, mark which need transcoding.
     Returns list of paths queued as 'pending'."""
     queued = []
@@ -30,6 +31,9 @@ def scan_folder(root, target_codec, target_container, skip_if_match=True):
             # if we failed it before, leave it as error unless manually reset
             if existing and existing["status"] == "error":
                 continue
+            # skip files that have exceeded the retry cap
+            if existing and (existing.get("attempts") or 0) >= MAX_ATTEMPTS:
+                continue
             info = probe(p)
             if not info:
                 db.upsert_file(path_str, status="unreadable", error="ffprobe failed",
@@ -44,6 +48,14 @@ def scan_folder(root, target_codec, target_container, skip_if_match=True):
                                codec_in=codec_in, container_in=container_in,
                                size_in=info["size"], duration_in=info["duration"])
                 continue
+            # skip tiny/already-efficient files that won't save space
+            if min_bitrate_kbps > 0 and info.get("bit_rate"):
+                if info["bit_rate"] < min_bitrate_kbps * 1000:
+                    db.upsert_file(path_str, status="skipped",
+                                   error=f"below min bitrate ({info['bit_rate']//1000} kbps < {min_bitrate_kbps} kbps)",
+                                   codec_in=codec_in, container_in=container_in,
+                                   size_in=info["size"], duration_in=info["duration"])
+                    continue
             db.upsert_file(path_str, status="pending",
                            codec_in=codec_in, container_in=container_in,
                            size_in=info["size"], duration_in=info["duration"])

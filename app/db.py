@@ -74,3 +74,35 @@ def get_setting(key, default=None):
 def set_setting(key, value):
     with _lock, get_conn() as c:
         c.execute("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
+
+def savings_by_show():
+    """Group done rows by parent folder (show/season) and compute savings."""
+    with get_conn() as c:
+        rs = c.execute("""
+            SELECT path, size_in, size_out FROM files
+            WHERE status='done' AND size_in > 0 AND size_out > 0
+        """).fetchall()
+    groups = {}
+    for r in rs:
+        # use parent dir as the show key
+        parent = str(Path(r["path"]).parent)
+        # trim parent to last 2 path components for a friendlier label
+        parts = parent.rstrip("/").split("/")
+        label = "/".join(parts[-2:]) if len(parts) >= 2 else parent
+        g = groups.setdefault(label, {"count": 0, "size_in": 0, "size_out": 0})
+        g["count"] += 1
+        g["size_in"] += r["size_in"]
+        g["size_out"] += r["size_out"]
+    return [{"show": k, **v, "saved": v["size_in"] - v["size_out"],
+             "pct": (1 - v["size_out"]/v["size_in"]) * 100 if v["size_in"] else 0}
+            for k, v in sorted(groups.items())]
+
+def requeue_stuck():
+    """Revert any 'working' rows back to 'pending' so they get picked up after a crash.
+    Returns list of paths requeued."""
+    with _lock, get_conn() as c:
+        rs = c.execute("SELECT path FROM files WHERE status='working'").fetchall()
+        paths = [r["path"] for r in rs]
+        if paths:
+            c.execute("UPDATE files SET status='pending', error='requeued after restart' WHERE status='working'")
+        return paths

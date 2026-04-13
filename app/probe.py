@@ -26,11 +26,11 @@ CODEC_NAME_MAP = {
 def _test_encoder(encoder, hwaccel=None):
     """Actually try encoding 1 frame to prove the GPU backend works at runtime."""
     cmd = ["ffmpeg", "-hide_banner", "-v", "error", "-f", "lavfi",
-           "-i", "nullsrc=s=64x64:d=0.1", "-frames:v", "1"]
+           "-i", "nullsrc=s=256x256:d=0.1", "-frames:v", "1"]
     if hwaccel == "vaapi":
         cmd = ["ffmpeg", "-hide_banner", "-v", "error",
                "-vaapi_device", "/dev/dri/renderD128",
-               "-f", "lavfi", "-i", "nullsrc=s=64x64:d=0.1",
+               "-f", "lavfi", "-i", "nullsrc=s=256x256:d=0.1",
                "-vf", "format=nv12,hwupload", "-frames:v", "1"]
     cmd += ["-c:v", encoder, "-f", "null", "-"]
     try:
@@ -38,6 +38,17 @@ def _test_encoder(encoder, hwaccel=None):
         return r.returncode == 0
     except (FileNotFoundError, subprocess.TimeoutExpired):
         return False
+
+@lru_cache(maxsize=1)
+def nvidia_gpu_count():
+    """Return number of NVENC-capable NVIDIA GPUs present, or 0."""
+    try:
+        r = subprocess.run(["nvidia-smi", "-L"], capture_output=True, text=True, timeout=5)
+        if r.returncode != 0:
+            return 0
+        return sum(1 for line in r.stdout.splitlines() if line.strip().startswith("GPU "))
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return 0
 
 @lru_cache(maxsize=1)
 def available_encoders():
@@ -106,6 +117,13 @@ def probe(path):
         duration = float(data["format"]["duration"])
     except (KeyError, ValueError):
         duration = 0.0
+    size = int(data.get("format", {}).get("size", 0))
+    try:
+        bit_rate = int(data["format"].get("bit_rate") or 0)
+    except ValueError:
+        bit_rate = 0
+    if not bit_rate and duration > 0 and size:
+        bit_rate = int(size * 8 / duration)
     return {
         "duration": duration,
         "video_codec": v_codec,
@@ -113,7 +131,8 @@ def probe(path):
         "video_count": video_count,
         "audio_count": audio_count,
         "subtitle_count": subtitle_count,
-        "size": int(data.get("format", {}).get("size", 0)),
+        "size": size,
+        "bit_rate": bit_rate,
     }
 
 def normalize_codec(name):

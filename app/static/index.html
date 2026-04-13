@@ -84,9 +84,23 @@
           </select></label>
         <label><span>Quality</span>
           <select name="quality">
+            <option value="original" selected>Original (visually lossless — recommended)</option>
+            <option value="high">High</option>
+            <option value="medium">Medium</option>
             <option value="low">Low (smaller)</option>
-            <option value="medium" selected>Medium</option>
-            <option value="high">High (bigger)</option>
+          </select></label>
+        <label><span>Keep language</span>
+          <select name="language">
+            <option value="all" selected>All (keep every audio/sub)</option>
+            <option value="eng">English</option>
+            <option value="spa">Spanish</option>
+            <option value="fre">French</option>
+            <option value="ger">German</option>
+            <option value="ita">Italian</option>
+            <option value="por">Portuguese</option>
+            <option value="jpn">Japanese</option>
+            <option value="chi">Chinese</option>
+            <option value="rus">Russian</option>
           </select></label>
         <label><span>Audio</span>
           <select name="audio">
@@ -102,8 +116,18 @@
             <option value="yes" selected>Yes (safe)</option>
             <option value="no">No (delete after verify)</option>
           </select></label>
+        <label><span>Skip files below bitrate (kbps, 0=off)</span>
+          <input type="number" name="min_bitrate_kbps" value="0" min="0" step="100"></label>
+        <label><span>Max height / downscale (0=off, e.g. 1080)</span>
+          <input type="number" name="max_height" value="0" min="0" step="1"></label>
+        <label><span>Schedule: run only between (hours 0-23, blank=always)</span>
+          <span style="display:flex;gap:6px"><input type="number" name="schedule_start" placeholder="start" min="0" max="23" style="flex:1"><input type="number" name="schedule_end" placeholder="end" min="0" max="23" style="flex:1"></span></label>
+        <label><span>Monitor interval (seconds)</span>
+          <input type="number" name="monitor_interval" value="60" min="10" step="10"></label>
         <button type="submit">Save Settings</button>
         <button type="button" id="btn-scan">Scan &amp; Queue</button>
+        <button type="button" id="btn-pause" class="secondary">Pause</button>
+        <button type="button" id="btn-resume" class="secondary">Resume</button>
       </form>
     </div>
 
@@ -118,6 +142,10 @@
       <h2>Status</h2>
       <div id="stats"></div>
       <div id="current-job" style="margin-top:10px"></div>
+    </div>
+    <div class="card">
+      <h2>Savings by show</h2>
+      <div id="stats-shows" class="muted">Loading…</div>
     </div>
     <div class="card">
       <h2>Files</h2>
@@ -160,8 +188,9 @@ let filter = "";
 
 async function loadStatus() {
   const r = await fetch("/api/status"); const s = await r.json();
-  $("#worker-status").textContent = s.running ? "● running" : "○ stopped";
-  $("#worker-status").style.color = s.running ? "#2a5" : "#888";
+  const label = s.paused ? "❚❚ paused" : (s.running ? "● running" : "○ stopped");
+  $("#worker-status").textContent = label;
+  $("#worker-status").style.color = s.paused ? "#da5" : (s.running ? "#2a5" : "#888");
   const c = s.counts || {};
   $("#stats").innerHTML =
     `<span class="stat"><b>${c.pending||0}</b> pending</span>` +
@@ -238,6 +267,24 @@ $("#btn-start").addEventListener("click", async () => {
 $("#btn-stop").addEventListener("click", async () => {
   await fetch("/api/worker/stop", {method:"POST"}); loadStatus();
 });
+$("#btn-pause").addEventListener("click", async () => {
+  await fetch("/api/worker/pause", {method:"POST"}); loadStatus();
+});
+$("#btn-resume").addEventListener("click", async () => {
+  await fetch("/api/worker/resume", {method:"POST"}); loadStatus();
+});
+async function loadShowStats() {
+  try {
+    const r = await fetch("/api/stats/shows");
+    const data = await r.json();
+    if (!data.length) { $("#stats-shows").innerHTML = '<span class="muted">No completed files yet</span>'; return; }
+    const rows = data.map(s => {
+      const inGB = (s.size_in/1e9).toFixed(2), outGB = (s.size_out/1e9).toFixed(2), savedGB = (s.saved/1e9).toFixed(2);
+      return `<tr><td>${s.show}</td><td>${s.count}</td><td>${inGB} GB</td><td>${outGB} GB</td><td>${savedGB} GB (${s.pct.toFixed(1)}%)</td></tr>`;
+    }).join("");
+    $("#stats-shows").innerHTML = `<table><thead><tr><th>Show</th><th>#</th><th>In</th><th>Out</th><th>Saved</th></tr></thead><tbody>${rows}</tbody></table>`;
+  } catch(e) { $("#stats-shows").innerHTML = '<span class="muted">error</span>'; }
+}
 document.querySelectorAll("[data-filter]").forEach(b => b.addEventListener("click", () => {
   filter = b.dataset.filter; loadFiles();
 }));
@@ -283,9 +330,10 @@ document.addEventListener("mouseout", e => {
   if (e.target.classList?.contains("browser-item")) e.target.style.background = "";
 });
 
-loadStatus(); loadFiles();
+loadStatus(); loadFiles(); loadShowStats();
 setInterval(loadStatus, 1500);
 setInterval(loadFiles, 5000);
+setInterval(loadShowStats, 10000);
 </script>
 </body>
 </html>
