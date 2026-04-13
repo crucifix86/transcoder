@@ -1,0 +1,291 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Simple Transcoder</title>
+<style>
+  :root { color-scheme: dark; }
+  body { font-family: system-ui, sans-serif; margin: 0; background: #111; color: #eee; }
+  header { background: #1a1a1a; padding: 12px 20px; border-bottom: 1px solid #333;
+           display: flex; justify-content: space-between; align-items: center; }
+  header h1 { margin: 0; font-size: 18px; }
+  main { display: grid; grid-template-columns: 360px 1fr; gap: 20px; padding: 20px; }
+  .card { background: #1a1a1a; border: 1px solid #333; border-radius: 8px; padding: 16px; margin-bottom: 16px; }
+  .card h2 { margin: 0 0 12px; font-size: 14px; text-transform: uppercase; letter-spacing: 1px; color: #888; }
+  label { display: block; margin-bottom: 10px; font-size: 13px; }
+  label span { display: block; margin-bottom: 4px; color: #bbb; }
+  input[type=text], textarea, select {
+    width: 100%; padding: 6px 8px; background: #0c0c0c; color: #eee;
+    border: 1px solid #333; border-radius: 4px; font-family: inherit; font-size: 13px; box-sizing: border-box;
+  }
+  textarea { min-height: 70px; font-family: monospace; }
+  button { background: #2a5; color: #fff; border: 0; padding: 8px 16px; border-radius: 4px;
+           cursor: pointer; font-size: 13px; margin-right: 6px; }
+  button.secondary { background: #444; }
+  button.danger { background: #a33; }
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid #222; }
+  th { color: #888; font-weight: normal; text-transform: uppercase; font-size: 11px; }
+  tr.working td { background: #223; }
+  tr.error td { background: #311; }
+  tr.done td { background: #131; }
+  .pill { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; }
+  .pill.done { background: #2a5; } .pill.error { background: #a33; } .pill.pending { background: #666; }
+  .pill.working { background: #38c; } .pill.skipped { background: #555; } .pill.unreadable { background: #a33; }
+  .pill.superseded { background: #444; }
+  .progress { height: 4px; background: #333; border-radius: 2px; overflow: hidden; margin-top: 4px; }
+  .progress > div { height: 100%; background: #2a5; transition: width 0.3s; }
+  .stat { display: inline-block; margin-right: 16px; font-size: 13px; }
+  .stat b { color: #fff; font-size: 16px; }
+  .muted { color: #888; font-size: 11px; }
+  .path { font-family: monospace; word-break: break-all; }
+</style>
+</head>
+<body>
+<header>
+  <h1>🎬 Simple Transcoder</h1>
+  <div>
+    <span id="worker-status" class="muted">…</span>
+    <button id="btn-start" class="secondary">Start Worker</button>
+    <button id="btn-stop" class="secondary">Stop Worker</button>
+  </div>
+</header>
+
+<main>
+  <section>
+    <div class="card">
+      <h2>Settings</h2>
+      <form id="settings-form">
+        <label><span>Watch folders (one per line)
+            <button type="button" id="btn-browse" class="secondary" style="float:right;padding:2px 8px;font-size:11px">Browse…</button>
+          </span>
+          <textarea name="folders" placeholder="/media/movies&#10;/media/tv"></textarea></label>
+        <label><span>Target codec</span>
+          <select name="codec">
+            <option value="h264">H.264 (AVC)</option>
+            <option value="h265" selected>H.265 (HEVC)</option>
+            <option value="av1">AV1</option>
+            <option value="vp9">VP9</option>
+          </select></label>
+        <label><span>Container</span>
+          <select name="container">
+            <option value="mkv" selected>MKV</option>
+            <option value="mp4">MP4</option>
+            <option value="webm">WebM</option>
+          </select></label>
+        <label><span>Encoder</span>
+          <select name="encoder">
+            <option value="auto" selected>Auto (prefer GPU)</option>
+            <option value="nvenc">NVIDIA NVENC</option>
+            <option value="qsv">Intel QSV</option>
+            <option value="vaapi">VAAPI</option>
+            <option value="cpu">CPU</option>
+          </select></label>
+        <label><span>Quality</span>
+          <select name="quality">
+            <option value="low">Low (smaller)</option>
+            <option value="medium" selected>Medium</option>
+            <option value="high">High (bigger)</option>
+          </select></label>
+        <label><span>Audio</span>
+          <select name="audio">
+            <option value="copy" selected>Copy (no re-encode)</option>
+            <option value="aac">AAC 192k</option>
+          </select></label>
+        <label><span>Skip files already matching codec+container</span>
+          <select name="skip_if_match">
+            <option value="yes" selected>Yes</option><option value="no">No</option>
+          </select></label>
+        <label><span>Keep originals in .transcoder-trash</span>
+          <select name="keep_originals">
+            <option value="yes" selected>Yes (safe)</option>
+            <option value="no">No (delete after verify)</option>
+          </select></label>
+        <button type="submit">Save Settings</button>
+        <button type="button" id="btn-scan">Scan &amp; Queue</button>
+      </form>
+    </div>
+
+    <div class="card">
+      <h2>Available Encoders</h2>
+      <div id="encoders" class="muted">Loading…</div>
+    </div>
+  </section>
+
+  <section>
+    <div class="card">
+      <h2>Status</h2>
+      <div id="stats"></div>
+      <div id="current-job" style="margin-top:10px"></div>
+    </div>
+    <div class="card">
+      <h2>Files</h2>
+      <div style="margin-bottom:8px">
+        <button class="secondary" data-filter="">All</button>
+        <button class="secondary" data-filter="working">Working</button>
+        <button class="secondary" data-filter="pending">Pending</button>
+        <button class="secondary" data-filter="done">Done</button>
+        <button class="secondary" data-filter="error">Errors</button>
+        <button class="secondary" data-filter="skipped">Skipped</button>
+      </div>
+      <table id="files-table">
+        <thead><tr>
+          <th>Status</th><th>File</th><th>In</th><th>Out</th><th>Size</th><th></th>
+        </tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+</main>
+
+<div id="browser" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.7);z-index:10;align-items:center;justify-content:center">
+  <div style="background:#1a1a1a;border:1px solid #333;border-radius:8px;width:min(600px,90vw);max-height:80vh;display:flex;flex-direction:column">
+    <div style="padding:12px 16px;border-bottom:1px solid #333;display:flex;justify-content:space-between;align-items:center">
+      <strong id="browser-path" style="font-family:monospace;font-size:13px">/</strong>
+      <button class="secondary" onclick="closeBrowser()">✕</button>
+    </div>
+    <div id="browser-list" style="overflow:auto;padding:8px"></div>
+    <div style="padding:12px 16px;border-top:1px solid #333;display:flex;gap:8px;justify-content:flex-end">
+      <button class="secondary" onclick="closeBrowser()">Cancel</button>
+      <button onclick="addCurrentFolder()">Add This Folder</button>
+    </div>
+  </div>
+</div>
+
+<script>
+const $ = s => document.querySelector(s);
+const fmtSize = n => !n ? "—" : n > 1e9 ? (n/1e9).toFixed(2)+" GB" : (n/1e6).toFixed(1)+" MB";
+let filter = "";
+
+async function loadStatus() {
+  const r = await fetch("/api/status"); const s = await r.json();
+  $("#worker-status").textContent = s.running ? "● running" : "○ stopped";
+  $("#worker-status").style.color = s.running ? "#2a5" : "#888";
+  const c = s.counts || {};
+  $("#stats").innerHTML =
+    `<span class="stat"><b>${c.pending||0}</b> pending</span>` +
+    `<span class="stat"><b>${c.working||0}</b> working</span>` +
+    `<span class="stat"><b>${c.done||0}</b> done</span>` +
+    `<span class="stat"><b>${c.error||0}</b> errors</span>` +
+    `<span class="stat"><b>${c.skipped||0}</b> skipped</span>` +
+    `<span class="stat"><b>${s.queue_size}</b> in queue</span>`;
+  if (s.current) {
+    const p = (s.progress[s.current] || {});
+    const pct = (p.pct || 0).toFixed(1);
+    $("#current-job").innerHTML =
+      `<div class="path">${s.current}</div>` +
+      `<div class="progress"><div style="width:${pct}%"></div></div>` +
+      `<div class="muted">${pct}% · ${(p.fps||0).toFixed(1)} fps · ${(p.speed||0).toFixed(2)}x</div>`;
+  } else {
+    $("#current-job").innerHTML = '<span class="muted">Idle</span>';
+  }
+  const enc = s.encoders || {};
+  $("#encoders").innerHTML = Object.keys(enc).length
+    ? Object.entries(enc).map(([k,v]) => `<div><b>${k}</b>: ${v.join(", ")}</div>`).join("")
+    : '<span style="color:#a55">No encoders detected — is ffmpeg installed?</span>';
+  // apply settings to form on first load only
+  if (!window._settingsLoaded) {
+    const f = $("#settings-form");
+    for (const [k,v] of Object.entries(s.settings||{})) {
+      if (f.elements[k]) f.elements[k].value = v;
+    }
+    window._settingsLoaded = true;
+  }
+}
+async function loadFiles() {
+  const r = await fetch("/api/files?limit=300" + (filter ? "&status="+filter : ""));
+  const rows = await r.json();
+  const tbody = $("#files-table tbody");
+  tbody.innerHTML = rows.map(f => {
+    const saved = (f.size_in && f.size_out) ? ((1 - f.size_out/f.size_in)*100).toFixed(0) + "% saved" : "";
+    const sizeCell = f.size_out
+      ? `${fmtSize(f.size_in)} → ${fmtSize(f.size_out)} <span class="muted">${saved}</span>`
+      : fmtSize(f.size_in);
+    return `<tr class="${f.status}">
+      <td><span class="pill ${f.status}">${f.status}</span></td>
+      <td class="path">${f.path}${f.error ? `<div class="muted" style="color:#c77">${f.error}</div>` : ""}</td>
+      <td>${f.codec_in||"?"} / ${f.container_in||"?"}</td>
+      <td>${f.codec_out||"—"} / ${f.container_out||"—"}</td>
+      <td>${sizeCell}</td>
+      <td>${(f.status==="error"||f.status==="unreadable")
+          ? `<button class="secondary" onclick="resetFile('${encodeURIComponent(f.path).replace(/'/g,"%27")}')">Retry</button>` : ""}</td>
+    </tr>`;
+  }).join("");
+}
+async function resetFile(p) {
+  await fetch("/api/reset/" + p, {method:"POST"});
+  loadFiles();
+}
+
+$("#settings-form").addEventListener("submit", async e => {
+  e.preventDefault();
+  const fd = new FormData(e.target);
+  await fetch("/api/settings", {method:"POST", body: fd});
+  alert("Saved");
+});
+$("#btn-scan").addEventListener("click", async () => {
+  const fd = new FormData($("#settings-form"));
+  await fetch("/api/settings", {method:"POST", body: fd});
+  const r = await fetch("/api/scan", {method:"POST"});
+  const j = await r.json();
+  alert(j.detail ? "Error: "+j.detail : `Queued ${j.queued} files`);
+  loadStatus(); loadFiles();
+});
+$("#btn-start").addEventListener("click", async () => {
+  await fetch("/api/worker/start", {method:"POST"}); loadStatus();
+});
+$("#btn-stop").addEventListener("click", async () => {
+  await fetch("/api/worker/stop", {method:"POST"}); loadStatus();
+});
+document.querySelectorAll("[data-filter]").forEach(b => b.addEventListener("click", () => {
+  filter = b.dataset.filter; loadFiles();
+}));
+
+let browserCurrent = "";
+async function openBrowser(start) {
+  $("#browser").style.display = "flex";
+  await browseTo(start || "/home/doug/Desktop");
+}
+function closeBrowser() { $("#browser").style.display = "none"; }
+async function browseTo(path) {
+  const r = await fetch("/api/browse?path=" + encodeURIComponent(path));
+  if (!r.ok) { alert("Cannot open: " + path); return; }
+  const d = await r.json();
+  browserCurrent = d.path;
+  $("#browser-path").textContent = d.path || "(roots)";
+  const items = [];
+  if (d.parent !== null) items.push(`<div class="browser-item" data-path="${d.parent}" style="padding:6px 10px;cursor:pointer;border-radius:4px">⬆ ..</div>`);
+  for (const dir of d.dirs) {
+    items.push(`<div class="browser-item" data-path="${dir.path.replace(/"/g,'&quot;')}" style="padding:6px 10px;cursor:pointer;border-radius:4px">📁 ${dir.name || dir.path}</div>`);
+  }
+  $("#browser-list").innerHTML = items.join("") || '<div class="muted" style="padding:10px">No subfolders</div>';
+  $("#browser-list").querySelectorAll(".browser-item").forEach(el => {
+    el.addEventListener("click", () => browseTo(el.dataset.path));
+  });
+}
+function addCurrentFolder() {
+  if (!browserCurrent) { alert("Navigate into a folder first"); return; }
+  const ta = document.querySelector("textarea[name=folders]");
+  const lines = ta.value.split("\n").map(s=>s.trim()).filter(Boolean);
+  if (!lines.includes(browserCurrent)) lines.push(browserCurrent);
+  ta.value = lines.join("\n");
+  closeBrowser();
+}
+$("#btn-browse").addEventListener("click", () => openBrowser());
+$("#browser").addEventListener("click", e => {
+  if (e.target.id === "browser") closeBrowser();
+});
+document.addEventListener("mouseover", e => {
+  if (e.target.classList?.contains("browser-item")) e.target.style.background = "#2a2a2a";
+});
+document.addEventListener("mouseout", e => {
+  if (e.target.classList?.contains("browser-item")) e.target.style.background = "";
+});
+
+loadStatus(); loadFiles();
+setInterval(loadStatus, 1500);
+setInterval(loadFiles, 5000);
+</script>
+</body>
+</html>

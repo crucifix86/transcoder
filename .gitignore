@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+transcoder.db
+transcoder.db-shm
+transcoder.db-wal
+*.log
+.env
+.DS_Store
