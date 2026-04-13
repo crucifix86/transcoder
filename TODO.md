@@ -4,12 +4,9 @@
 - [x] Crash resume: on startup, requeue any rows stuck in "working"
 - [x] Disk-space check before transcode (free >= source size, abort if not)
 - [x] Per-file retry cap (fail permanently after 3 attempts)
-- [ ] Configurable backup destination — instead of `.transcoder-trash/` inside the
-      watched folder, let users set a central backup path, ideally on a DIFFERENT
-      physical disk. Protects against cases where the source disk itself goes bad
-      mid-run (power loss corrupting the FS, a dying drive, etc.) — if backup lives
-      on a separate disk it can't be taken down with the source. Include free-space
-      check on the backup path too. Makes one-folder-at-a-time workflow much safer.
+- [x] Configurable backup destination — central backup path preserves folder
+      structure and includes free-space check. Ideal when placed on a different
+      physical disk than the source.
 - [ ] Lock file on watch folder (deferred — not needed for single-instance use)
 
 ## Features
@@ -22,13 +19,27 @@
 - [x] Folder monitoring (auto-enqueue new files)
 
 ## Big-library scaling (important for Unraid / 50k+ file libraries)
-- [ ] mtime cache per folder — skip files whose mtime predates last scan
-- [ ] Parallel probing (e.g. 8 concurrent ffprobes) to speed first-scan ingest
-- [ ] Rotating incremental scan — one folder per monitor tick instead of all
-- [ ] Lazy probe — enqueue by path, probe inside worker; makes scan non-blocking
-- [ ] Progress indicator for long first-scans (UI currently gives no feedback)
+- [x] mtime cache per directory — stored in dir_mtimes table
+- [x] Parallel probing (8 concurrent ffprobes) for first-scan ingest
+- [x] Rotating incremental scan — one folder per monitor tick
+- [x] Progress indicator for long first-scans (walked/probed/queued live in UI)
+- [ ] Lazy probe — enqueue by path, probe inside worker (may not be needed
+      now that parallel probing exists; revisit if first-scan is still slow
+      on huge libraries)
+
+## Distributed transcoding (Tdarr-style nodes) — future
+- [ ] Worker-node mode — deferred until after Docker/Unraid packaging. Groundwork
+      already in place: DB-based job lease with heartbeat and auto-reclaim of
+      expired leases (see claim_next_pending/extend_lease/release_lease in db.py).
+      To finish: extract `do_transcode_job()` as a DB-free helper, add
+      /api/node/{claim,heartbeat,complete} endpoints with bearer-token auth,
+      write a standalone `app/node.py` process with path-mapping, and surface
+      connected nodes in the UI.
 
 ## Deferred
 - Plex/Jellyfin refresh webhook (outgoing, on completion)
 - Sonarr/Radarr import webhook (incoming)
-- HDR→SDR tonemapping when downscaling (currently scales HDR without tonemapping)
+
+## Done (polish)
+- [x] HDR→SDR tonemapping when downscaling — CPU zscale+tonemap chain kicks
+      in when source is PQ/HLG and max_height is set; output is bt709 SDR.

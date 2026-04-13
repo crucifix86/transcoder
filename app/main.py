@@ -22,6 +22,7 @@ DEFAULTS = {
     "audio": "copy",         # copy | aac
     "language": "all",       # all | eng | spa | fre | ger | jpn | rus | chi | ita | por
     "keep_originals": "yes", # yes | no
+    "backup_path": "",       # empty = use in-folder .transcoder-trash; else central backup
     "skip_if_match": "yes",
     "min_bitrate_kbps": "0",  # 0 = disabled
     "max_height": "0",        # 0 = no cap; else e.g. 1080
@@ -32,14 +33,21 @@ DEFAULTS = {
 
 _monitor_stop = threading.Event()
 
+_monitor_idx = 0
+
 def _monitor_loop():
-    """Periodically rescan watched folders and auto-enqueue new files."""
+    """Periodically rescan ONE watched folder and auto-enqueue new files.
+    Rotates through folders so each tick stays cheap even with a large library."""
+    global _monitor_idx
     while not _monitor_stop.is_set():
         try:
             s = current_settings()
             folders = [line.strip() for line in s["folders"].splitlines() if line.strip()]
-            min_kbps = int(s.get("min_bitrate_kbps", "0") or 0)
-            for folder in folders:
+            if folders:
+                idx = _monitor_idx % len(folders)
+                folder = folders[idx]
+                _monitor_idx = idx + 1
+                min_kbps = int(s.get("min_bitrate_kbps", "0") or 0)
                 found = scanner.scan_folder(folder, s["codec"], s["container"],
                                             skip_if_match=(s["skip_if_match"] == "yes"),
                                             min_bitrate_kbps=min_kbps)
@@ -92,6 +100,7 @@ def status():
         "running": worker.is_running(),
         "paused": worker.is_paused(),
         "workers": worker.worker_count(),
+        "scan": scanner.progress_snapshot(),
         "encoders": available_encoders(),
         "settings": current_settings(),
     }
@@ -110,6 +119,7 @@ async def save_settings(
     audio: str = Form("copy"),
     language: str = Form("all"),
     keep_originals: str = Form("yes"),
+    backup_path: str = Form(""),
     skip_if_match: str = Form("yes"),
     min_bitrate_kbps: str = Form("0"),
     max_height: str = Form("0"),
@@ -120,7 +130,8 @@ async def save_settings(
     for k, v in dict(folders=folders, codec=codec, container=container,
                      encoder=encoder, quality=quality, audio=audio,
                      language=language,
-                     keep_originals=keep_originals, skip_if_match=skip_if_match,
+                     keep_originals=keep_originals, backup_path=backup_path,
+                     skip_if_match=skip_if_match,
                      min_bitrate_kbps=min_bitrate_kbps, max_height=max_height,
                      schedule_start=schedule_start, schedule_end=schedule_end,
                      monitor_interval=monitor_interval).items():

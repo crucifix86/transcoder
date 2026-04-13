@@ -1,8 +1,12 @@
+import os
 import sqlite3
 import threading
 from pathlib import Path
 
-DB_PATH = Path(__file__).parent.parent / "transcoder.db"
+# Respect TRANSCODER_DATA_DIR so Docker can bind-mount /data for persistence.
+_data_dir = Path(os.environ.get("TRANSCODER_DATA_DIR") or Path(__file__).parent.parent)
+_data_dir.mkdir(parents=True, exist_ok=True)
+DB_PATH = _data_dir / "transcoder.db"
 _lock = threading.Lock()
 
 SCHEMA = """
@@ -20,11 +24,17 @@ CREATE TABLE IF NOT EXISTS files (
     started_at REAL,
     finished_at REAL,
     duration_in REAL,
-    duration_out REAL
+    duration_out REAL,
+    leased_by TEXT,
+    lease_expires REAL
 );
 CREATE TABLE IF NOT EXISTS settings (
     key TEXT PRIMARY KEY,
     value TEXT
+);
+CREATE TABLE IF NOT EXISTS dir_mtimes (
+    dir TEXT PRIMARY KEY,
+    mtime REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_status ON files(status);
 """
@@ -38,6 +48,13 @@ def get_conn():
 def init():
     with _lock, get_conn() as c:
         c.executescript(SCHEMA)
+        # Additive migrations for older DBs — sqlite can't IF NOT EXISTS columns,
+        # so catch the duplicate-column error and move on.
+        for col, ddl in [("leased_by", "TEXT"), ("lease_expires", "REAL")]:
+            try:
+                c.execute(f"ALTER TABLE files ADD COLUMN {col} {ddl}")
+            except sqlite3.OperationalError:
+                pass
 
 def upsert_file(path, **fields):
     cols = ["path"] + list(fields.keys())
@@ -75,6 +92,16 @@ def set_setting(key, value):
     with _lock, get_conn() as c:
         c.execute("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
 
+def get_dir_mtime(d):
+    with get_conn() as c:
+        r = c.execute("SELECT mtime FROM dir_mtimes WHERE dir=?", (d,)).fetchone()
+        return r["mtime"] if r else 0.0
+
+def set_dir_mtime(d, mtime):
+    with _lock, get_conn() as c:
+        c.execute("INSERT INTO dir_mtimes(dir,mtime) VALUES(?,?) ON CONFLICT(dir) DO UPDATE SET mtime=excluded.mtime",
+                  (d, mtime))
+
 def savings_by_show():
     """Group done rows by parent folder (show/season) and compute savings."""
     with get_conn() as c:
@@ -97,11 +124,67 @@ def savings_by_show():
              "pct": (1 - v["size_out"]/v["size_in"]) * 100 if v["size_in"] else 0}
             for k, v in sorted(groups.items())]
 
-def requeue_stuck():
-    """Return all paths that should be (re)queued on startup: any 'working' rows
-    (crash mid-transcode) and any 'pending' rows (queued but not yet processed).
-    'working' gets reverted to 'pending'."""
+def claim_next_pending(node_id, lease_seconds=120):
+    """Atomically claim the oldest pending file (or one with an expired lease).
+    Returns the path string, or None if nothing to claim.
+    Sets status='working', leased_by, lease_expires."""
+    import time as _time
+    now = _time.time()
+    new_expires = now + lease_seconds
     with _lock, get_conn() as c:
-        c.execute("UPDATE files SET status='pending', error='requeued after restart' WHERE status='working'")
+        # Eligible: pending, OR working with an expired lease (dead worker).
+        row = c.execute("""
+            SELECT path FROM files
+            WHERE status='pending'
+               OR (status='working' AND (lease_expires IS NULL OR lease_expires < ?))
+            ORDER BY
+              CASE WHEN status='pending' THEN 0 ELSE 1 END,
+              COALESCE(started_at, 0),
+              path
+            LIMIT 1
+        """, (now,)).fetchone()
+        if not row:
+            return None
+        path = row["path"]
+        # Claim it. If someone else raced us, our UPDATE still wins because
+        # we're single-writer under _lock; but we still guard with a WHERE that
+        # re-checks the claim predicate in case the row moved between select and update.
+        c.execute("""
+            UPDATE files
+            SET status='working', leased_by=?, lease_expires=?, started_at=?,
+                attempts=COALESCE(attempts,0)+1
+            WHERE path=? AND (status='pending'
+                              OR (status='working' AND (lease_expires IS NULL OR lease_expires < ?)))
+        """, (node_id, new_expires, now, path, now))
+        if c.total_changes:
+            return path
+        return None
+
+def extend_lease(path, node_id, seconds=120):
+    """Heartbeat — push the lease forward. Returns True if we still hold it."""
+    import time as _time
+    new_expires = _time.time() + seconds
+    with _lock, get_conn() as c:
+        cur = c.execute(
+            "UPDATE files SET lease_expires=? WHERE path=? AND leased_by=? AND status='working'",
+            (new_expires, path, node_id),
+        )
+        return cur.rowcount > 0
+
+def release_lease(path, node_id):
+    """Drop the lease fields without touching status (caller sets done/error)."""
+    with _lock, get_conn() as c:
+        c.execute(
+            "UPDATE files SET leased_by=NULL, lease_expires=NULL WHERE path=? AND leased_by=?",
+            (path, node_id),
+        )
+
+def requeue_stuck():
+    """On startup: convert any orphaned 'working' rows back to 'pending' and drop
+    their leases so another worker can pick them up. This covers the case where
+    the server itself crashed (not just the ffmpeg process)."""
+    with _lock, get_conn() as c:
+        c.execute("""UPDATE files SET status='pending', error='requeued after restart',
+                     leased_by=NULL, lease_expires=NULL WHERE status='working'""")
         rs = c.execute("SELECT path FROM files WHERE status='pending'").fetchall()
         return [r["path"] for r in rs]

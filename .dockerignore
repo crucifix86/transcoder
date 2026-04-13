@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+.git/
+.github/
+data/
+transcoder.db*
+*.log
+.env
+.DS_Store
+TODO.md

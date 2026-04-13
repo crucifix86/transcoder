@@ -133,11 +133,13 @@
           <select name="skip_if_match">
             <option value="yes" selected>Yes</option><option value="no">No</option>
           </select></label>
-        <label><span>Keep originals in .transcoder-trash</span>
+        <label><span>Keep originals</span>
           <select name="keep_originals">
             <option value="yes" selected>Yes (safe)</option>
             <option value="no">No (delete after verify)</option>
           </select></label>
+        <label><span>Backup destination (empty = in-folder .transcoder-trash; ideally on a DIFFERENT disk)</span>
+          <input type="text" name="backup_path" placeholder="/mnt/backup/transcoder"></label>
         <label><span>Skip files below bitrate (kbps, 0=off)</span>
           <input type="number" name="min_bitrate_kbps" value="0" min="0" step="100"></label>
         <label><span>Max height / downscale (0=off, e.g. 1080)</span>
@@ -167,6 +169,7 @@
       <h2>Status</h2>
       <div id="stats"></div>
       <div id="current-job" style="margin-top:10px"></div>
+      <div id="scan-progress" style="margin-top:10px;padding-top:10px;border-top:1px solid #333;display:none"></div>
     </div>
     <div class="card">
       <h2>Savings by show</h2>
@@ -233,6 +236,15 @@ async function loadStatus() {
       `<div class="muted">${pct}% · ${(p.fps||0).toFixed(1)} fps · ${(p.speed||0).toFixed(2)}x</div>`;
   } else {
     $("#current-job").innerHTML = '<span class="muted">Idle</span>';
+  }
+  const sc = s.scan || {};
+  if (sc.active) {
+    $("#scan-progress").innerHTML =
+      `<div class="muted">Scanning <span class="path">${sc.folder}</span></div>` +
+      `<div class="muted">${sc.walked} walked · ${sc.probed} probed · ${sc.queued} queued</div>`;
+    $("#scan-progress").style.display = "block";
+  } else {
+    $("#scan-progress").style.display = "none";
   }
   const enc = s.encoders || {};
   $("#encoders").innerHTML = Object.keys(enc).length

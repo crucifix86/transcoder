@@ -1,0 +1,22 @@
+services:
+  transcoder:
+    image: ghcr.io/crucifix86/transcoder:latest
+    container_name: transcoder
+    restart: unless-stopped
+    ports:
+      - "8765:8765"
+    volumes:
+      - ./data:/data                    # DB + state
+      - /mnt/user/Media:/media          # your library (read/write — originals get replaced)
+      - /mnt/user/Backup/transcoder:/backup  # backup destination (see Settings > Rules)
+    # NVIDIA GPU passthrough (requires nvidia-container-toolkit on host)
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    # Intel/AMD VAAPI alternative — uncomment instead of the nvidia block above:
+    # devices:
+    #   - /dev/dri:/dev/dri

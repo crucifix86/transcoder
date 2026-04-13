@@ -7,3 +7,4 @@ transcoder.db-wal
 *.log
 .env
 .DS_Store
+data/

@@ -1,14 +1,19 @@
 import os
 import re
 import shutil
+import socket
 import subprocess
 import threading
 import time
 from pathlib import Path
-from queue import Queue, Empty
 from . import db
 from .probe import probe, pick_encoder, normalize_codec, nvidia_gpu_count
 from .scanner import TRASH_DIRNAME, TEMP_SUFFIX
+
+LEASE_SECONDS = 120
+HEARTBEAT_SECONDS = 30
+POLL_INTERVAL = 2
+NODE_ID = f"{socket.gethostname()}:{os.getpid()}"
 
 # Quality presets per codec. Values tuned for reasonable size+quality.
 # For GPU encoders we use -cq/-global_quality; for CPU we use -crf.
@@ -31,7 +36,6 @@ MAX_ATTEMPTS = 3
 
 _progress = {}  # path -> {"pct": float, "fps": float, "speed": float}
 _progress_lock = threading.Lock()
-_queue = Queue()
 _worker_threads = []
 _stop_flag = threading.Event()
 _pause_flag = threading.Event()
@@ -42,10 +46,14 @@ def progress_snapshot():
         return dict(_progress)
 
 def enqueue(path):
-    _queue.put(path)
+    """Back-compat shim: scanner now writes 'pending' rows directly to the DB,
+    which workers poll. Keeping this no-op so callers don't break."""
+    return
 
 def queue_size():
-    return _queue.qsize()
+    # Pending rows in DB are the queue.
+    counts = db.counts()
+    return counts.get("pending", 0)
 
 def current():
     # For backward-compat: first active path, else None
@@ -56,7 +64,7 @@ def current():
 def current_all():
     return dict(_current_paths)
 
-def build_cmd(src, dst, target_codec, target_container, method_pref, quality, audio_mode, src_bitrate=0, gpu_index=0, language="all", max_height=0):
+def build_cmd(src, dst, target_codec, target_container, method_pref, quality, audio_mode, src_bitrate=0, gpu_index=0, language="all", max_height=0, is_hdr=False):
     encoder, method = pick_encoder(target_codec, method_pref)
     if not encoder:
         return None, f"no encoder available for {target_codec}/{method_pref}"
@@ -67,13 +75,19 @@ def build_cmd(src, dst, target_codec, target_container, method_pref, quality, au
 
     cmd = ["ffmpeg", "-y", "-hide_banner", "-nostats", "-progress", "pipe:1"]
 
+    # HDR → SDR tonemapping needs CPU filter chain (zscale+tonemap).
+    # When we detect HDR AND the user wants a downscale, decode on CPU so
+    # frames can flow through the tonemap filter. Without downscale we keep
+    # the HDR untouched (copy color metadata is downstream's problem).
+    hdr_tonemap = is_hdr and max_height and max_height > 0
+
     # VAAPI needs hwaccel device + hwupload
-    if method == "vaapi":
+    if method == "vaapi" and not hdr_tonemap:
         cmd += ["-hwaccel", "vaapi", "-hwaccel_device", "/dev/dri/renderD128",
                 "-hwaccel_output_format", "vaapi"]
-    elif method == "qsv":
+    elif method == "qsv" and not hdr_tonemap:
         cmd += ["-hwaccel", "qsv"]
-    elif method == "nvenc":
+    elif method == "nvenc" and not hdr_tonemap:
         cmd += ["-hwaccel", "cuda", "-hwaccel_device", str(gpu_index)]
 
     cmd += ["-i", str(src), "-map", "0:v:0"]
@@ -86,9 +100,17 @@ def build_cmd(src, dst, target_codec, target_container, method_pref, quality, au
                 "-map", f"0:s:m:language:{language}?",
                 "-map", "0:s:m:language:und?"]
 
-    # optional downscale: only kicks in if source is taller than max_height
+    # optional downscale: only kicks in if source is taller than max_height.
+    # For HDR sources we run a CPU tonemap chain so the output is proper SDR
+    # bt709 — otherwise a scaled HDR file would look washed out on SDR screens.
     if max_height and max_height > 0:
-        if method == "vaapi":
+        if hdr_tonemap:
+            cmd += ["-vf",
+                    f"zscale=t=linear:npl=100,format=gbrpf32le,"
+                    f"zscale=p=bt709,tonemap=tonemap=hable:desat=0,"
+                    f"zscale=t=bt709:m=bt709:r=tv,format=yuv420p,"
+                    f"scale=-2:'min({max_height},ih)'"]
+        elif method == "vaapi":
             cmd += ["-vf", f"scale_vaapi=w=-2:h='min({max_height},ih)'"]
         elif method == "nvenc":
             cmd += ["-vf", f"scale_cuda=-2:'min({max_height},ih)'"]
@@ -183,11 +205,26 @@ def verify_output(src_info, dst_path, language_filter=False):
 
 def process_one(path_str, settings, gpu_index=0):
     _current_paths[gpu_index] = path_str
-    # Guard against stale queue entries: if this file already completed (or is
-    # being worked on by another GPU), drop it silently.
-    existing = db.get_file(path_str)
-    if existing and existing["status"] in ("done", "skipped", "working", "superseded"):
-        return
+    # Start a heartbeat so the lease doesn't expire mid-transcode; signal with
+    # a stop event when the job ends, and always release the lease in finally.
+    hb_stop = threading.Event()
+    def _heartbeat():
+        while not hb_stop.wait(HEARTBEAT_SECONDS):
+            if not db.extend_lease(path_str, NODE_ID, LEASE_SECONDS):
+                # We lost the lease (expired and another worker took over).
+                # Bail out of the heartbeat; the outer worker will notice when
+                # it finishes and discovers the row no longer belongs to us.
+                return
+    hb_thread = threading.Thread(target=_heartbeat, daemon=True)
+    hb_thread.start()
+    try:
+        _process_one_body(path_str, settings, gpu_index)
+    finally:
+        hb_stop.set()
+        db.release_lease(path_str, NODE_ID)
+
+def _process_one_body(path_str, settings, gpu_index=0):
+    # The lease already moved this row to 'working', so no need to re-check status.
     src = Path(path_str)
     if not src.exists():
         db.upsert_file(path_str, status="error", error="file gone before transcode")
@@ -199,6 +236,8 @@ def process_one(path_str, settings, gpu_index=0):
     quality = settings.get("quality", "medium")
     audio_mode = settings.get("audio", "copy")
     keep_originals = settings.get("keep_originals", "yes") == "yes"
+    backup_path = (settings.get("backup_path") or "").strip()
+    watched_folders = [line.strip() for line in (settings.get("folders") or "").splitlines() if line.strip()]
     language = settings.get("language", "all")
     try:
         max_height = int(settings.get("max_height", 0) or 0)
@@ -210,20 +249,35 @@ def process_one(path_str, settings, gpu_index=0):
         db.upsert_file(path_str, status="unreadable", error="ffprobe failed pre-encode")
         return
 
-    # Disk-space safety: need at least source_size free in the target dir.
+    # Disk-space safety: transcode output lands next to source; original moves
+    # to backup. Need ~source_size free in both places (they're the same disk when
+    # no central backup is configured).
+    src_size = src_info.get("size") or 0
     try:
-        free = shutil.disk_usage(str(src.parent)).free
-        if src_info["size"] and free < src_info["size"]:
+        free_target = shutil.disk_usage(str(src.parent)).free
+        if src_size and free_target < src_size:
             db.upsert_file(path_str, status="error",
-                           error=f"insufficient disk space: {free/1e9:.1f}GB free, need ~{src_info['size']/1e9:.1f}GB",
+                           error=f"insufficient disk space at target: {free_target/1e9:.1f}GB free, need ~{src_size/1e9:.1f}GB",
                            finished_at=time.time())
             return
+        if backup_path and keep_originals:
+            try:
+                free_backup = shutil.disk_usage(backup_path).free
+                if src_size and free_backup < src_size:
+                    db.upsert_file(path_str, status="error",
+                                   error=f"insufficient disk space at backup: {free_backup/1e9:.1f}GB free, need ~{src_size/1e9:.1f}GB",
+                                   finished_at=time.time())
+                    return
+            except OSError as e:
+                db.upsert_file(path_str, status="error",
+                               error=f"backup path unreachable: {e}",
+                               finished_at=time.time())
+                return
     except OSError:
         pass
 
-    db.upsert_file(path_str, status="working", error=None,
-                   started_at=time.time(),
-                   attempts=(db.get_file(path_str) or {}).get("attempts", 0) + 1)
+    # status=working, started_at, and attempts already set by claim_next_pending.
+    db.upsert_file(path_str, error=None)
 
     dst = src.with_suffix(TEMP_SUFFIX + "." + target_container)
     # clean up any stale temp from prior crash
@@ -233,7 +287,7 @@ def process_one(path_str, settings, gpu_index=0):
 
     cmd, err = build_cmd(src, dst, target_codec, target_container, method_pref, quality, audio_mode,
                          src_bitrate=src_info.get("bit_rate", 0), gpu_index=gpu_index, language=language,
-                         max_height=max_height)
+                         max_height=max_height, is_hdr=bool(src_info.get("is_hdr")))
     if err:
         db.upsert_file(path_str, status="error", error=err, finished_at=time.time())
         return
@@ -281,9 +335,37 @@ def process_one(path_str, settings, gpu_index=0):
 
     dst_info = probe(dst)
 
-    # Safe replace: move original to trash dir, rename new file to final name
-    trash_dir = src.parent / TRASH_DIRNAME
-    trash_dir.mkdir(exist_ok=True)
+    # Safe replace: move original to backup, rename new file to final name.
+    # Backup destination is either the central backup_path (preserving folder
+    # structure relative to the matching watched folder) or the legacy
+    # in-folder .transcoder-trash/.
+    trash_dir = None
+    if backup_path:
+        watched_root = None
+        for wf in watched_folders:
+            try:
+                Path(src).resolve().relative_to(Path(wf).resolve())
+                watched_root = Path(wf).resolve()
+                break
+            except ValueError:
+                continue
+        try:
+            rel_parent = src.parent.resolve().relative_to(watched_root) if watched_root else Path(src.parent.name)
+        except ValueError:
+            rel_parent = Path(src.parent.name)
+        trash_dir = Path(backup_path) / rel_parent
+    else:
+        trash_dir = src.parent / TRASH_DIRNAME
+    try:
+        trash_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        db.upsert_file(path_str, status="error",
+                       error=f"could not create backup dir {trash_dir}: {e}",
+                       finished_at=time.time())
+        if dst.exists():
+            try: dst.unlink()
+            except OSError: pass
+        return
     trash_path = trash_dir / src.name
     # avoid collision
     i = 1
@@ -357,18 +439,18 @@ def _run_loop(settings_getter, gpu_index):
         if _pause_flag.is_set() or not _in_schedule_window(settings_getter()):
             time.sleep(5)
             continue
-        try:
-            path = _queue.get(timeout=1)
-        except Empty:
+        path = db.claim_next_pending(NODE_ID, LEASE_SECONDS)
+        if not path:
+            time.sleep(POLL_INTERVAL)
             continue
         try:
             process_one(path, settings_getter(), gpu_index=gpu_index)
         except Exception as e:
             db.upsert_file(path, status="error", error=f"worker crash: {e}",
                            finished_at=time.time())
+            db.release_lease(path, NODE_ID)
         finally:
             _current_paths.pop(gpu_index, None)
-            _queue.task_done()
 
 def start(settings_getter):
     global _worker_threads

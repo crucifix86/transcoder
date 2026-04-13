@@ -98,6 +98,7 @@ def probe(path):
     video_count = 0
     audio_count = 0
     subtitle_count = 0
+    color_transfer = None
     for s in data.get("streams", []):
         t = s.get("codec_type")
         if t == "video":
@@ -107,6 +108,7 @@ def probe(path):
             video_count += 1
             if v_codec is None:
                 v_codec = s.get("codec_name")
+                color_transfer = s.get("color_transfer")
         elif t == "audio":
             audio_count += 1
             if a_codec is None:
@@ -124,6 +126,8 @@ def probe(path):
         bit_rate = 0
     if not bit_rate and duration > 0 and size:
         bit_rate = int(size * 8 / duration)
+    # HDR detection: PQ (smpte2084) or HLG (arib-std-b67) color transfer
+    is_hdr = color_transfer in ("smpte2084", "arib-std-b67")
     return {
         "duration": duration,
         "video_codec": v_codec,
@@ -133,6 +137,8 @@ def probe(path):
         "subtitle_count": subtitle_count,
         "size": size,
         "bit_rate": bit_rate,
+        "is_hdr": is_hdr,
+        "color_transfer": color_transfer,
     }
 
 def normalize_codec(name):
