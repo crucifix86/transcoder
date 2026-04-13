@@ -1,13 +1,11 @@
-FROM jrottenberg/ffmpeg:7.0-nvidia AS ffmpeg
-FROM python:3.12-slim
+# Use the nvidia-ffmpeg image directly as the base so ffmpeg + its bundled
+# codec libs live in their intended spot without clashing with a second distro's
+# glibc (the previous multi-stage COPY /usr/local overwrote libc.so.6).
+FROM jrottenberg/ffmpeg:7.0-nvidia
 
-# ffmpeg binaries + its own bundled codec .so files come from the multi-stage base
-COPY --from=ffmpeg /usr/local /usr/local
-RUN /sbin/ldconfig /usr/local/lib
-# System runtime deps only: VAAPI for Intel/AMD hardware accel, and curl for the
-# healthcheck. All codec libs (x264/x265/vpx/fdk-aac/etc.) ship inside /usr/local
-# from the ffmpeg base, so we do NOT apt-install them here.
+ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
+      python3 python3-pip python3-venv \
       libva2 libva-drm2 libva-x11-2 vainfo \
       libnuma1 libass9 libfreetype6 libfontconfig1 \
       curl ca-certificates \
@@ -15,7 +13,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip3 install --no-cache-dir --break-system-packages -r requirements.txt
 COPY app ./app
 
 # DB + persistent state live under /data so they survive container rebuilds.
@@ -27,4 +25,6 @@ EXPOSE 8765
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
   CMD curl -fsS http://localhost:8765/api/status > /dev/null || exit 1
 
+# The base image's ENTRYPOINT is ffmpeg itself — override it.
+ENTRYPOINT []
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8765"]
